@@ -1,0 +1,11 @@
+spring:
+  application:
+    name: rate-limiter
+  data:
+    redis:
+      # Reads REDIS_HOST from the environment if set, otherwise falls back
+      # to localhost -- so this still works unchanged when you run the app
+      # directly (mvn spring-boot:run), and works differently when
+      # containerized (we'll pass REDIS_HOST=host.docker.internal below).
+      host: ${REDIS_HOST:localhost}
+      port: 6379
