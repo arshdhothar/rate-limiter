@@ -1,0 +1,31 @@
+{
+  "location": "canadacentral",
+  "properties": {
+    "managedEnvironmentId": "/subscriptions/79541cc3-3e42-45bb-ae00-37e5d3ff31b7/resourceGroups/rate-limiter-rg/providers/Microsoft.App/managedEnvironments/rate-limiter-env",
+    "configuration": {
+      "ingress": {
+        "external": true,
+        "targetPort": 8080,
+        "transport": "auto"
+      }
+    },
+    "template": {
+      "containers": [
+        {
+          "name": "rate-limiter",
+          "image": "ghcr.io/arshdhothar/rate-limiter:latest",
+          "resources": { "cpu": 0.5, "memory": "1Gi" },
+          "env": [
+            { "name": "REDIS_HOST", "value": "localhost" }
+          ]
+        },
+        {
+          "name": "redis",
+          "image": "redis:7-alpine",
+          "resources": { "cpu": 0.25, "memory": "0.5Gi" }
+        }
+      ],
+      "scale": { "minReplicas": 1, "maxReplicas": 1 }
+    }
+  }
+}
