@@ -1,5 +1,6 @@
 import http from 'k6/http';
 import { Counter, Trend } from 'k6/metrics';
+import exec from 'k6/execution';
 
 // ---------------------------------------------------------------------------
 // Config
@@ -30,6 +31,12 @@ const hotOk = new Counter('hot_allowed');
 const hotLimited = new Counter('hot_rejected');
 const burstOk = new Counter('burst_allowed');
 const burstLimited = new Counter('burst_rejected');
+// Anything other than 200/429 (5xx, resets, timeouts) is an ERROR, tracked per
+// phase and never mixed into "rejected" or into latency.
+const warmupErrors = new Counter('warmup_errors');
+const spreadErrors = new Counter('spread_errors');
+const hotErrors = new Counter('hot_errors');
+const burstErrors = new Counter('burst_errors');
 // Wall-clock time (ms) of each ALLOWED hot/burst request. min/max of these
 // give the real observation window, so the token-bucket invariant
 //   allowed <= capacity + refill_rate * window
@@ -88,8 +95,12 @@ export const options = {
     },
   },
   thresholds: {
-    // Only 5xx / timeouts count as failures (429s are expected, see above).
-    http_req_failed: ['rate<0.001'],
+    // The measured phases must be error-free (no 5xx / resets / timeouts).
+    // Warm-up errors are reported but don't fail the run: cold start is
+    // expected to be rough, and it's excluded from the measured numbers.
+    spread_errors: ['count==0'],
+    hot_errors: ['count==0'],
+    burst_errors: ['count==0'],
     // Throughput phase must actually sustain the target rate (<1% dropped).
     'dropped_iterations{scenario:spread_load}': [`count<${Math.ceil(RATE * 30 * 0.01)}`],
     // 5 initial tokens + 30s of refill = 35; +1 of slack for network jitter.
@@ -105,12 +116,31 @@ function call(clientId) {
   });
 }
 
+const isDecision = (res) => res.status === 200 || res.status === 429;
+
+// Per-VU counter so we log only the first couple of unexpected responses per
+// scenario (enough to see what's failing without flooding the terminal).
+const logged = {};
+function noteError(res, counter) {
+  counter.add(1);
+  const name = exec.scenario.name;
+  logged[name] = (logged[name] || 0) + 1;
+  if (logged[name] <= 2) {
+    console.error(
+      `[${name}] unexpected response: status=${res.status} error="${res.error || ''}" ` +
+        `code=${res.error_code || ''} body="${String(res.body || '').slice(0, 80)}"`
+    );
+  }
+}
+
 export function warmup() {
-  call(`warm-${Math.floor(Math.random() * 2000)}`);
+  const res = call(`warm-${Math.floor(Math.random() * 2000)}`);
+  if (!isDecision(res)) noteError(res, warmupErrors);
 }
 
 export function spread() {
   const res = call(`client-${Math.floor(Math.random() * 2000)}`);
+  if (!isDecision(res)) return noteError(res, spreadErrors);
   spreadLatency.add(res.timings.duration);
   if (res.status === 200) spreadOk.add(1);
   else spreadLimited.add(1);
@@ -118,6 +148,7 @@ export function spread() {
 
 export function hot() {
   const res = call(`hot-${RUN_ID}`);
+  if (!isDecision(res)) return noteError(res, hotErrors);
   hotLatency.add(res.timings.duration);
   if (res.status === 200) {
     hotOk.add(1);
@@ -129,6 +160,7 @@ export function hot() {
 
 export function burst() {
   const res = call(`burst-${RUN_ID}`);
+  if (!isDecision(res)) return noteError(res, burstErrors);
   if (res.status === 200) {
     burstOk.add(1);
     burstAllowedTs.add(Date.now());
@@ -152,7 +184,8 @@ export function handleSummary(data) {
 
   const spreadCount = v('spread_allowed', 'count') + v('spread_rejected', 'count');
   const hotCount = v('hot_allowed', 'count') + v('hot_rejected', 'count');
-  const dropped = m['dropped_iterations'] ? v('dropped_iterations', 'count') : 0;
+  // Spread-phase drops only (the built-in metric also counts warm-up drops).
+  const dropped = v('dropped_iterations{scenario:spread_load}', 'count');
 
   // Observation window of allowed requests, from client-side timestamps.
   const window = (tsMetric) => (v(tsMetric, 'max') - v(tsMetric, 'min')) / 1000;
@@ -167,16 +200,22 @@ export function handleSummary(data) {
   lines.push(`=== Rate limiter load test  (target ${BASE}, RUN_ID ${RUN_ID}) ===`);
   lines.push('');
   lines.push(`Throughput scenario  (${RATE} req/s target, 2000 clients, 30s, after warm-up)`);
-  lines.push(`  achieved:  ${(spreadCount / 30).toFixed(0)} req/s   (${spreadCount} completed, ${dropped} dropped)`);
+  lines.push(`  achieved:  ${(spreadCount / 30).toFixed(0)} req/s   (${spreadCount} completed, ${dropped} dropped, ${v('spread_errors', 'count')} errors)`);
   lines.push(`  latency:   ${latency('spread_latency')}`);
   lines.push('');
   lines.push('Hot-client scenario  (50 concurrent VUs, ONE client, 30s)');
-  lines.push(`  achieved:  ${(hotCount / 30).toFixed(0)} req/s   (each request runs the atomic Lua check)`);
+  lines.push(`  achieved:  ${(hotCount / 30).toFixed(0)} req/s   (each request runs the atomic Lua check; ${v('hot_errors', 'count')} errors)`);
   lines.push(`  latency:   ${latency('hot_latency')}`);
   lines.push(`  ${check('correctness', v('hot_allowed', 'count'), window('hot_allowed_ts'))}`);
   lines.push('');
-  lines.push('Burst scenario  (500 requests, 50 VUs, one fresh client)');
+  lines.push(`Burst scenario  (500 requests, 50 VUs, one fresh client; ${v('burst_errors', 'count')} errors)`);
   lines.push(`  ${check('correctness', v('burst_allowed', 'count'), window('burst_allowed_ts'))}`);
+  lines.push('');
+  lines.push(
+    `Errors (non-200/429) by phase: warm-up ${v('warmup_errors', 'count')}, throughput ${v('spread_errors', 'count')}, ` +
+      `hot ${v('hot_errors', 'count')}, burst ${v('burst_errors', 'count')}   ` +
+      `(all phases: ${v('http_req_failed', 'passes')} failed of ${v('http_reqs', 'count')} requests)`
+  );
   lines.push('');
   lines.push('Thresholds');
   for (const [name, metric] of Object.entries(m)) {
