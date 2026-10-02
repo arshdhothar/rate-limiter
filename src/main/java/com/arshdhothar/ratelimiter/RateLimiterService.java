@@ -41,15 +41,16 @@ public class RateLimiterService {
         // worth knowing -- it's what would let this shard correctly across
         // multiple Redis nodes later without a code change.
         String key = "ratelimit:{" + clientId + "}";
-        double now = System.currentTimeMillis() / 1000.0;
 
+        // No timestamp is passed in: the Lua script reads the clock from Redis
+        // (TIME), so refill is computed against a single clock no matter how
+        // requests were scheduled in the JVM or which app instance sent them.
         List<Long> result = redisTemplate.execute(
                 tokenBucketScript,
                 Collections.singletonList(key),
                 String.valueOf(capacity),
                 String.valueOf(refillRate),
-                String.valueOf(requested),
-                String.valueOf(now)
+                String.valueOf(requested)
         );
 
         boolean allowed = result.get(0) == 1L;
